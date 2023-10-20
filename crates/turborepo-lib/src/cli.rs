@@ -7,12 +7,12 @@ use clap_complete::{generate, Shell};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, error};
 use turbopath::AbsoluteSystemPathBuf;
+use turborepo_repository::inference::{RepoMode, RepoState};
 use turborepo_ui::UI;
 
 use crate::{
     commands::{bin, daemon, generate, info, link, login, logout, prune, unlink, CommandBase},
     get_version,
-    shim::{RepoMode, RepoState},
     tracing::TurboSubscriber,
     Payload,
 };
@@ -681,6 +681,9 @@ pub async fn run(
         }
     }
 
+    // TODO: make better use of RepoState, here and below. We've already inferred
+    // the repo root, we don't need to calculate it again, along with package
+    // manager inference.
     let cwd = repo_state
         .as_ref()
         .map(|state| state.root.as_path())
@@ -705,7 +708,7 @@ pub async fn run(
         }
         #[allow(unused_variables)]
         Command::Daemon { command, idle_time } => {
-            let base = CommandBase::new(cli_args.clone(), repo_root, version, ui)?;
+            let base = CommandBase::new(cli_args.clone(), repo_root, version, ui);
 
             match command {
                 Some(command) => daemon::daemon_client(command, &base).await,
@@ -740,7 +743,7 @@ pub async fn run(
         }
         Command::Info { workspace } => {
             let workspace = workspace.clone();
-            let mut base = CommandBase::new(cli_args, repo_root, version, ui)?;
+            let mut base = CommandBase::new(cli_args, repo_root, version, ui);
             info::run(&mut base, workspace.as_deref())?;
 
             Ok(Payload::Rust(Ok(0)))
@@ -756,7 +759,7 @@ pub async fn run(
 
             let modify_gitignore = !*no_gitignore;
             let to = *target;
-            let mut base = CommandBase::new(cli_args, repo_root, version, ui)?;
+            let mut base = CommandBase::new(cli_args, repo_root, version, ui);
 
             if let Err(err) = link::link(&mut base, modify_gitignore, to).await {
                 error!("error: {}", err.to_string())
@@ -765,7 +768,7 @@ pub async fn run(
             Ok(Payload::Rust(Ok(0)))
         }
         Command::Logout { .. } => {
-            let mut base = CommandBase::new(cli_args, repo_root, version, ui)?;
+            let mut base = CommandBase::new(cli_args, repo_root, version, ui);
             logout::logout(&mut base)?;
 
             Ok(Payload::Rust(Ok(0)))
@@ -778,7 +781,7 @@ pub async fn run(
 
             let sso_team = sso_team.clone();
 
-            let mut base = CommandBase::new(cli_args, repo_root, version, ui)?;
+            let mut base = CommandBase::new(cli_args, repo_root, version, ui);
 
             if let Some(sso_team) = sso_team {
                 login::sso_login(&mut base, &sso_team).await?;
@@ -795,7 +798,7 @@ pub async fn run(
             }
 
             let from = *target;
-            let mut base = CommandBase::new(cli_args, repo_root, version, ui)?;
+            let mut base = CommandBase::new(cli_args, repo_root, version, ui);
 
             unlink::unlink(&mut base, from)?;
 
@@ -808,7 +811,11 @@ pub async fn run(
             if args.tasks.is_empty() {
                 return Err(anyhow!("at least one task must be specified"));
             }
-            let base = CommandBase::new(cli_args.clone(), repo_root, version, ui)?;
+            if let Some(file_path) = &args.profile {
+                // TODO: Do we want to handle the result / error?
+                let _ = logger.enable_chrome_tracing(file_path);
+            }
+            let base = CommandBase::new(cli_args.clone(), repo_root, version, ui);
 
             if args.experimental_rust_codepath {
                 use crate::commands::run;
@@ -823,10 +830,13 @@ pub async fn run(
             if args.experimental_rust_codepath {
                 tracing::warn!("rust codepath enabled, but not compiled with support");
             }
+            if let Some(file_path) = &args.profile {
+                logger.enable_chrome_tracing(file_path)?;
+            }
             if args.tasks.is_empty() {
                 return Err(anyhow!("at least one task must be specified"));
             }
-            let base = CommandBase::new(cli_args, repo_root, version, ui)?;
+            let base = CommandBase::new(cli_args, repo_root, version, ui);
             Ok(Payload::Go(Box::new(base)))
         }
         Command::Prune {
@@ -842,7 +852,7 @@ pub async fn run(
                 .unwrap_or_default();
             let docker = *docker;
             let output_dir = output_dir.clone();
-            let base = CommandBase::new(cli_args, repo_root, version, ui)?;
+            let base = CommandBase::new(cli_args, repo_root, version, ui);
             prune::prune(&base, &scope, docker, &output_dir)?;
             Ok(Payload::Rust(Ok(0)))
         }

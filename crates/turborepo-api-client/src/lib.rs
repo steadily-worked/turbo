@@ -20,7 +20,7 @@ pub use crate::error::{Error, Result};
 
 mod error;
 mod retry;
-mod spaces;
+pub mod spaces;
 
 lazy_static! {
     static ref AUTHORIZATION_REGEX: Regex =
@@ -87,6 +87,7 @@ pub trait Client {
     fn make_url(&self, endpoint: &str) -> String;
 }
 
+#[derive(Clone)]
 pub struct APIClient {
     client: reqwest::Client,
     base_url: String,
@@ -94,6 +95,7 @@ pub struct APIClient {
     use_preflight: bool,
 }
 
+#[derive(Clone)]
 pub struct APIAuth {
     pub team_id: String,
     pub token: String,
@@ -436,14 +438,16 @@ impl APIClient {
         timeout: u64,
         version: &str,
         use_preflight: bool,
-    ) -> Result<APIClient> {
-        let client = if timeout != 0 {
+    ) -> Result<Self> {
+        let client_build = if timeout != 0 {
             reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(timeout))
-                .build()?
+                .build()
         } else {
-            reqwest::Client::builder().build()?
+            reqwest::Client::builder().build()
         };
+
+        let client = client_build.map_err(Error::TlsError)?;
 
         let user_agent = format!(
             "turbo {} {} {} {}",

@@ -27,6 +27,7 @@ use constant_condition::{ConstantCondition, ConstantConditionValue};
 use constant_value::ConstantValue;
 use indexmap::IndexSet;
 use lazy_static::lazy_static;
+use num_traits::Zero;
 use parking_lot::Mutex;
 use regex::Regex;
 use swc_core::{
@@ -48,7 +49,6 @@ use swc_core::{
 use turbo_tasks::{TryJoinIterExt, Upcast, Value, Vc};
 use turbo_tasks_fs::{FileJsonContent, FileSystemPath};
 use turbopack_core::{
-    chunk::availability_info::AvailabilityInfoNeeds,
     compile_time_info::{CompileTimeInfo, FreeVarReference},
     error::PrettyPrintError,
     issue::{analyze::AnalyzeIssue, IssueExt, IssueSeverity, IssueSource, OptionIssueSource},
@@ -88,7 +88,8 @@ use super::{
         graph::{create_graph, Effect},
         linker::link,
         well_known::replace_well_known,
-        JsValue, ObjectPart, WellKnownFunctionKind, WellKnownObjectKind,
+        ConstantValue as JsConstantValue, JsValue, ObjectPart, WellKnownFunctionKind,
+        WellKnownObjectKind,
     },
     errors,
     parse::{parse, ParseResult},
@@ -108,12 +109,10 @@ use crate::{
         imports::{ImportedSymbol, Reexport},
         parse_require_context,
         top_level_await::has_top_level_await,
-        ModuleValue, RequireContextValue,
+        ConstantNumber, ConstantString, ModuleValue, RequireContextValue,
     },
     chunk::EcmascriptExports,
-    code_gen::{
-        CodeGen, CodeGenerateable, CodeGenerateableWithAvailabilityInfo, CodeGenerateables,
-    },
+    code_gen::{CodeGen, CodeGenerateable, CodeGenerateableWithAsyncModuleInfo, CodeGenerateables},
     magic_identifier,
     references::{
         async_module::{AsyncModule, OptionAsyncModule},
@@ -136,48 +135,6 @@ pub struct AnalyzeEcmascriptModuleResult {
     pub async_module: Vc<OptionAsyncModule>,
     /// `true` when the analysis was successful.
     pub successful: bool,
-}
-
-#[turbo_tasks::value_impl]
-impl AnalyzeEcmascriptModuleResult {
-    /// Returns the pieces of AvailabilityInfo that are required for code
-    /// generation.
-    #[turbo_tasks::function]
-    pub async fn get_availability_info_needs(
-        self: Vc<Self>,
-        is_async_module: bool,
-    ) -> Result<Vc<AvailabilityInfoNeeds>> {
-        let AnalyzeEcmascriptModuleResult {
-            references,
-            code_generation,
-            ..
-        } = &*self.await?;
-        let mut needs = AvailabilityInfoNeeds::none();
-        for c in code_generation.await?.iter() {
-            if let CodeGen::CodeGenerateableWithAvailabilityInfo(code_gen) = c {
-                needs |= *code_gen
-                    .get_availability_info_needs(is_async_module)
-                    .await?;
-                if needs.is_complete() {
-                    return Ok(needs.cell());
-                }
-            }
-        }
-        for r in references.await?.iter() {
-            if let Some(code_gen) =
-                Vc::try_resolve_sidecast::<Box<dyn CodeGenerateableWithAvailabilityInfo>>(*r)
-                    .await?
-            {
-                needs |= *code_gen
-                    .get_availability_info_needs(is_async_module)
-                    .await?;
-                if needs.is_complete() {
-                    return Ok(needs.cell());
-                }
-            }
-        }
-        Ok(needs.cell())
-    }
 }
 
 /// A temporary analysis result builder to pass around, to be turned into an
@@ -222,10 +179,10 @@ impl AnalyzeEcmascriptModuleResultBuilder {
     #[allow(dead_code)]
     pub fn add_code_gen_with_availability_info<C>(&mut self, code_gen: Vc<C>)
     where
-        C: Upcast<Box<dyn CodeGenerateableWithAvailabilityInfo>>,
+        C: Upcast<Box<dyn CodeGenerateableWithAsyncModuleInfo>>,
     {
         self.code_gens
-            .push(CodeGen::CodeGenerateableWithAvailabilityInfo(Vc::upcast(
+            .push(CodeGen::CodeGenerateableWithAsyncModuleInfo(Vc::upcast(
                 code_gen,
             )));
     }
@@ -257,7 +214,7 @@ impl AnalyzeEcmascriptModuleResultBuilder {
                 CodeGen::CodeGenerateable(c) => {
                     *c = c.resolve().await?;
                 }
-                CodeGen::CodeGenerateableWithAvailabilityInfo(c) => {
+                CodeGen::CodeGenerateableWithAsyncModuleInfo(c) => {
                     *c = c.resolve().await?;
                 }
             }
@@ -939,22 +896,22 @@ pub(crate) async fn analyze_ecmascript_module(
             Effect::FreeVar {
                 var,
                 ast_path,
-                span: _,
+                span,
                 in_try: _,
             } => {
-                handle_free_var(&ast_path, var, &analysis_state, &mut analysis).await?;
+                handle_free_var(&ast_path, var, span, &analysis_state, &mut analysis).await?;
             }
             Effect::Member {
                 obj,
                 prop,
                 ast_path,
-                span: _,
+                span,
                 in_try,
             } => {
                 let obj = analysis_state.link_value(obj, in_try).await?;
                 let prop = analysis_state.link_value(prop, in_try).await?;
 
-                handle_member(&ast_path, obj, prop, &analysis_state, &mut analysis).await?;
+                handle_member(&ast_path, obj, prop, span, &analysis_state, &mut analysis).await?;
             }
             Effect::ImportedBinding {
                 esm_reference_index,
@@ -1323,6 +1280,12 @@ async fn handle_call<G: Fn(Vec<Effect>) + Send + Sync>(
         }
         JsValue::WellKnownFunction(WellKnownFunctionKind::ChildProcessSpawnMethod(name)) => {
             let args = linked_args(args).await?;
+
+            // Is this specifically `spawn(process.argv[0], ['-e', ...])`?
+            if is_invoking_node_process_eval(&args) {
+                return Ok(());
+            }
+
             if !args.is_empty() {
                 let mut show_dynamic_warning = false;
                 let pat = js_value_to_pattern(&args[0]);
@@ -1674,6 +1637,7 @@ async fn handle_member(
     ast_path: &[AstParentKind],
     obj: JsValue,
     prop: JsValue,
+    span: Span,
     state: &AnalysisState<'_>,
     analysis: &mut AnalyzeEcmascriptModuleResultBuilder,
 ) -> Result<()> {
@@ -1690,7 +1654,7 @@ async fn handle_member(
                     continue;
                 }
                 if obj.iter_defineable_name_rev().eq(it)
-                    && handle_free_var_reference(ast_path, value, state, analysis).await?
+                    && handle_free_var_reference(ast_path, value, span, state, analysis).await?
                 {
                     return Ok(());
                 }
@@ -1717,6 +1681,7 @@ async fn handle_member(
 async fn handle_free_var(
     ast_path: &[AstParentKind],
     var: JsValue,
+    span: Span,
     state: &AnalysisState<'_>,
     analysis: &mut AnalyzeEcmascriptModuleResultBuilder,
 ) -> Result<()> {
@@ -1727,10 +1692,11 @@ async fn handle_free_var(
             if name.len() != def_name_len {
                 continue;
             }
+
             if var
                 .iter_defineable_name_rev()
                 .eq(name.iter().map(Cow::Borrowed).rev())
-                && handle_free_var_reference(ast_path, value, state, analysis).await?
+                && handle_free_var_reference(ast_path, value, span, state, analysis).await?
             {
                 return Ok(());
             }
@@ -1743,6 +1709,7 @@ async fn handle_free_var(
 async fn handle_free_var_reference(
     ast_path: &[AstParentKind],
     value: &FreeVarReference,
+    span: Span,
     state: &AnalysisState<'_>,
     analysis: &mut AnalyzeEcmascriptModuleResultBuilder,
 ) -> Result<bool> {
@@ -1759,7 +1726,16 @@ async fn handle_free_var_reference(
     ) {
         return Ok(false);
     }
+
     match value {
+        FreeVarReference::Error(error_message) => state.handler.span_err_with_code(
+            span,
+            error_message,
+            DiagnosticId::Error(
+                errors::failed_to_analyse::ecmascript::FREE_VAR_REFERENCE.to_string(),
+            ),
+        ),
+
         FreeVarReference::Value(value) => {
             analysis.add_code_gen(ConstantValue::new(
                 Value::new(value.clone()),
@@ -2714,4 +2690,50 @@ fn detect_dynamic_export(p: &Program) -> DetectedDynamicExportType {
     } else {
         DetectedDynamicExportType::None
     }
+}
+
+/// Detects whether a list of arguments is specifically
+/// `(process.argv[0], ['-e', ...])`. This is useful for detecting if a node
+/// process is being spawned to interpret a string of JavaScript code, and does
+/// not require static analysis.
+fn is_invoking_node_process_eval(args: &[JsValue]) -> bool {
+    if args.len() < 2 {
+        return false;
+    }
+
+    if let JsValue::Member(_, obj, constant) = &args[0] {
+        // Is the first argument to spawn `process.argv[]`?
+        if let (
+            box JsValue::WellKnownObject(WellKnownObjectKind::NodeProcessArgv),
+            box JsValue::Constant(JsConstantValue::Num(ConstantNumber(num))),
+        ) = (obj, constant)
+        {
+            // Is it specifically `process.argv[0]`?
+            if num.is_zero() {
+                if let JsValue::Array {
+                    total_nodes: _,
+                    items,
+                    mutable: _,
+                } = &args[1]
+                {
+                    // Is `-e` one of the arguments passed to the program?
+                    if items.iter().any(|e| {
+                        if let JsValue::Constant(JsConstantValue::Str(ConstantString::Word(arg))) =
+                            e
+                        {
+                            arg == "-e"
+                        } else {
+                            false
+                        }
+                    }) {
+                        // If so, this is likely spawning node to evaluate a string, and
+                        // does not need to be statically analyzed.
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
 }
